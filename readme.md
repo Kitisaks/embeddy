@@ -1,6 +1,6 @@
 # 🌍 Multilingual Embedding API
 
-A FastAPI-powered service for generating multilingual sentence embeddings using the [`intfloat/multilingual-e5-base`](https://huggingface.co/intfloat/multilingual-e5-base) model. Supports local inference, token-based authentication via API keys, and can be deployed easily using Docker.
+A FastAPI-powered service for generating multilingual sentence embeddings using the [`intfloat/multilingual-e5-large`](https://huggingface.co/intfloat/multilingual-e5-large) model. Supports local inference, token-based authentication via API keys, and can be deployed easily using Docker.
 
 ---
 
