@@ -5,8 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Install basic system packages
 RUN apt-get update && apt-get install -y \
-  git &&
-  rm -rf /var/lib/apt/lists/*
+  git && rm -rf /var/lib/apt/lists/*
 
 # Create working directory
 WORKDIR /app
