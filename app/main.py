@@ -1,13 +1,14 @@
 import os
 import logging
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer
 from starlette.status import HTTP_401_UNAUTHORIZED
+from starlette.concurrency import run_in_threadpool
 from dotenv import load_dotenv
 
 # Configure logging
@@ -34,13 +35,6 @@ def debug_api_key():
         logger.error("Please set EMBED_API_TOKEN in your .env file or environment")
     return API_TOKEN is not None
 
-# Initialize app
-app = FastAPI(
-    title="Text Embedding API",
-    description="API for generating text embeddings using multilingual E5 model",
-    version="1.0.0"
-)
-
 # Cached model initialization to avoid reloading
 @lru_cache(maxsize=1)
 def get_model():
@@ -48,15 +42,8 @@ def get_model():
     logger.info(f"Loading model: {MODEL}")
     return SentenceTransformer(MODEL)
 
-@lru_cache(maxsize=1)
-def get_tokenizer():
-    """Load and cache the tokenizer"""
-    logger.info(f"Loading tokenizer: {MODEL}")
-    return AutoTokenizer.from_pretrained(MODEL)
-
-# Initialize and debug on startup
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     """Initialize models and debug API key on startup"""
     logger.info("Starting up embedding service...")
     
@@ -68,11 +55,20 @@ async def startup_event():
     # Warm up models
     try:
         get_model()
-        get_tokenizer()
         logger.info("Models loaded successfully")
     except Exception as e:
         logger.error(f"Failed to load models: {e}")
         raise
+
+    yield
+
+# Initialize app
+app = FastAPI(
+    title="Text Embedding API",
+    description="API for generating text embeddings using multilingual E5 model",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 # Pydantic models
 class TextInput(BaseModel):
@@ -134,29 +130,32 @@ async def get_embedding(
 ) -> EmbeddingResponse:
     """Generate embeddings for input text"""
     try:
-        # Get cached models
+        # Get cached model (tokenizer is available from model internals)
         model = get_model()
-        tokenizer = get_tokenizer()
+        tokenizer = model.tokenizer
         
         # Prepare text with query prefix for E5 model
         text = f"query: {data.text.strip()}"
         
-        # Generate embedding
-        embedding = model.encode(
-            text, 
-            normalize_embeddings=True,
-            show_progress_bar=False,
-            convert_to_tensor=False
-        ).tolist()
+        # Run CPU/GPU-heavy inference in threadpool to avoid blocking event loop
+        embedding = await run_in_threadpool(
+            lambda: model.encode(
+                text,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+                convert_to_tensor=False,
+            ).tolist()
+        )
         
-        # Calculate token count
-        token_ids = tokenizer.encode(
-            text, 
+        # Calculate token count in one tokenizer pass
+        tokenized = tokenizer(
+            text,
             add_special_tokens=True,
             truncation=True,
-            max_length=tokenizer.model_max_length
+            max_length=tokenizer.model_max_length,
+            return_attention_mask=True,
         )
-        total_tokens = len(token_ids)
+        total_tokens = len(tokenized["input_ids"])
         
         logger.info(f"Generated embedding for text length: {len(data.text)}, tokens: {total_tokens}")
         
@@ -184,7 +183,7 @@ async def debug_config(_: None = Depends(verify_token)):
         "model": MODEL,
         "api_key_configured": API_TOKEN is not None,
         "api_key_length": len(API_TOKEN) if API_TOKEN else 0,
-        "model_max_length": get_tokenizer().model_max_length
+        "model_max_length": get_model().tokenizer.model_max_length
     }
 
 if __name__ == "__main__":
