@@ -1,68 +1,76 @@
 import os
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 from functools import lru_cache
-from typing import Optional
+from typing import Annotated, Optional
 
+import torch
 from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 from starlette.status import HTTP_401_UNAUTHORIZED
 from starlette.concurrency import run_in_threadpool
 from dotenv import load_dotenv
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load environment variables
 load_dotenv()
 
-# Constants
 MODEL = "intfloat/multilingual-e5-large"
 API_TOKEN = os.environ.get("EMBED_API_TOKEN")
+MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "32"))
+# Limit simultaneous inference calls so threads don't compete for CPU/GPU
+MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "4"))
 
-# Debug API key after initialization
-def debug_api_key():
-    """Debug API key configuration"""
+_inference_semaphore: asyncio.Semaphore
+
+
+def debug_api_key() -> bool:
     if API_TOKEN:
-        # Show first 8 and last 4 characters for security
-        masked_token = f"{API_TOKEN[:8]}...{API_TOKEN[-4:]}" if len(API_TOKEN) > 12 else "***"
-        logger.info(f"API token loaded successfully: {masked_token}")
-        logger.info(f"API token length: {len(API_TOKEN)} characters")
+        masked = f"{API_TOKEN[:8]}...{API_TOKEN[-4:]}" if len(API_TOKEN) > 12 else "***"
+        logger.info(f"API token loaded: {masked} ({len(API_TOKEN)} chars)")
     else:
-        logger.error("API token not found in environment variables!")
-        logger.error("Please set EMBED_API_TOKEN in your .env file or environment")
+        logger.error("EMBED_API_TOKEN not set — authentication will fail")
     return API_TOKEN is not None
 
-# Cached model initialization to avoid reloading
+
 @lru_cache(maxsize=1)
-def get_model():
-    """Load and cache the sentence transformer model"""
+def get_model() -> SentenceTransformer:
     logger.info(f"Loading model: {MODEL}")
-    return SentenceTransformer(MODEL)
+    model = SentenceTransformer(MODEL)
+    model.eval()
+    return model
+
+
+def _encode(model: SentenceTransformer, texts: list[str]) -> tuple[list[list[float]], list[int]]:
+    """Single tokenization pass: count tokens from attention mask, then run forward."""
+    features = model.tokenize(texts)
+    # Attention mask sum = actual (non-padding) token count per item
+    token_counts: list[int] = features["attention_mask"].sum(dim=1).tolist()
+    with torch.no_grad():
+        out = model.forward(features)
+    embeddings: list[list[float]] = out["sentence_embedding"].cpu().numpy().tolist()
+    return embeddings, token_counts
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    """Initialize models and debug API key on startup"""
-    logger.info("Starting up embedding service...")
-    
-    # Debug API key
-    api_key_ok = debug_api_key()
-    if not api_key_ok:
-        logger.warning("Service starting without valid API token - authentication will fail!")
-    
-    # Warm up models
+    global _inference_semaphore
+    logger.info("Starting embedding service...")
+    debug_api_key()
+    _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     try:
         get_model()
-        logger.info("Models loaded successfully")
+        logger.info("Model loaded successfully")
     except Exception as e:
-        logger.error(f"Failed to load models: {e}")
+        logger.error(f"Failed to load model: {e}")
         raise
-
     yield
 
-# Initialize app
+
 app = FastAPI(
     title="Text Embedding API",
     description="API for generating text embeddings using multilingual E5 model",
@@ -70,121 +78,119 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Pydantic models
+# Compress responses >= 1 KB (embeddings are ~4 KB uncompressed)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+
+# ---------- Pydantic models ----------
+
 class TextInput(BaseModel):
-    text: str = Field(..., min_length=1, max_length=8192, description="Text to embed")
+    text: str = Field(..., min_length=1, max_length=8192)
+
+
+class BatchTextInput(BaseModel):
+    texts: list[Annotated[str, Field(min_length=1, max_length=8192)]] = Field(
+        ..., min_length=1, max_length=MAX_BATCH_SIZE
+    )
+
 
 class EmbeddingResponse(BaseModel):
     embedding: list[float]
     usage: dict
 
-# Optimized token verification
+
+class BatchEmbeddingResponse(BaseModel):
+    embeddings: list[list[float]]
+    usage: dict
+
+
+# ---------- Auth ----------
+
 async def verify_token(authorization: Optional[str] = Header(None, alias="Authorization")):
-    """Verify Bearer token from Authorization header"""
     if not authorization:
         raise HTTPException(
-            status_code=HTTP_401_UNAUTHORIZED, 
+            status_code=HTTP_401_UNAUTHORIZED,
             detail="Authorization header required",
-            headers={"WWW-Authenticate": "Bearer"}
+            headers={"WWW-Authenticate": "Bearer"},
         )
-    
     if not authorization.startswith("Bearer "):
         raise HTTPException(
-            status_code=HTTP_401_UNAUTHORIZED, 
+            status_code=HTTP_401_UNAUTHORIZED,
             detail="Invalid authorization header format. Use 'Bearer <token>'",
-            headers={"WWW-Authenticate": "Bearer"}
+            headers={"WWW-Authenticate": "Bearer"},
         )
-    
-    token = authorization[7:]  # Remove "Bearer " prefix
-    
+    token = authorization[7:]
     if not API_TOKEN:
         logger.error("API token not configured")
-        raise HTTPException(
-            status_code=500, 
-            detail="Server configuration error"
-        )
-    
+        raise HTTPException(status_code=500, detail="Server configuration error")
     if token != API_TOKEN:
         logger.warning(f"Invalid token attempt: {token[:8]}...")
         raise HTTPException(
-            status_code=HTTP_401_UNAUTHORIZED, 
+            status_code=HTTP_401_UNAUTHORIZED,
             detail="Invalid token",
-            headers={"WWW-Authenticate": "Bearer"}
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
-# Health check endpoint
+
+# ---------- Endpoints ----------
+
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "model": MODEL,
-        "api_key_configured": API_TOKEN is not None
-    }
+    return {"status": "healthy", "model": MODEL, "api_key_configured": API_TOKEN is not None}
 
-# Main embedding endpoint
+
 @app.post("/embed", response_model=EmbeddingResponse)
 async def get_embedding(
-    data: TextInput, 
-    _: None = Depends(verify_token)
+    data: TextInput,
+    _: None = Depends(verify_token),
 ) -> EmbeddingResponse:
-    """Generate embeddings for input text"""
     try:
-        # Get cached model (tokenizer is available from model internals)
         model = get_model()
-        tokenizer = model.tokenizer
-        
-        # Prepare text with query prefix for E5 model
         text = f"query: {data.text.strip()}"
-        
-        # Run CPU/GPU-heavy inference in threadpool to avoid blocking event loop
-        embedding = await run_in_threadpool(
-            lambda: model.encode(
-                text,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-                convert_to_tensor=False,
-            ).tolist()
-        )
-        
-        # Calculate token count in one tokenizer pass
-        tokenized = tokenizer(
-            text,
-            add_special_tokens=True,
-            truncation=True,
-            max_length=tokenizer.model_max_length,
-            return_attention_mask=True,
-        )
-        total_tokens = len(tokenized["input_ids"])
-        
-        logger.info(f"Generated embedding for text length: {len(data.text)}, tokens: {total_tokens}")
-        
+        async with _inference_semaphore:
+            embeddings, token_counts = await run_in_threadpool(_encode, model, [text])
+        embedding, total_tokens = embeddings[0], token_counts[0]
+        logger.info(f"Embedded len={len(data.text)}, tokens={total_tokens}")
         return EmbeddingResponse(
             embedding=embedding,
-            usage={
-                "model": MODEL,
-                "total_tokens": total_tokens,
-                "text_length": len(data.text)
-            }
+            usage={"model": MODEL, "total_tokens": total_tokens, "text_length": len(data.text)},
         )
-        
     except Exception as e:
-        logger.error(f"Error generating embedding: {e}")
-        raise HTTPException(
-            status_code=500, 
-            detail="Failed to generate embedding"
-        )
+        logger.error(f"Embedding error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate embedding")
 
-# Debug endpoint (remove in production)
+
+@app.post("/embed/batch", response_model=BatchEmbeddingResponse)
+async def get_embeddings_batch(
+    data: BatchTextInput,
+    _: None = Depends(verify_token),
+) -> BatchEmbeddingResponse:
+    """Encode multiple texts in a single forward pass — far cheaper than N separate calls."""
+    try:
+        model = get_model()
+        texts = [f"query: {t.strip()}" for t in data.texts]
+        async with _inference_semaphore:
+            embeddings, token_counts = await run_in_threadpool(_encode, model, texts)
+        total_tokens = sum(token_counts)
+        logger.info(f"Batch embedded count={len(texts)}, total_tokens={total_tokens}")
+        return BatchEmbeddingResponse(
+            embeddings=embeddings,
+            usage={"model": MODEL, "total_tokens": total_tokens, "count": len(texts)},
+        )
+    except Exception as e:
+        logger.error(f"Batch embedding error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate embeddings")
+
+
 @app.get("/debug/config")
 async def debug_config(_: None = Depends(verify_token)):
-    """Debug configuration endpoint"""
     return {
         "model": MODEL,
         "api_key_configured": API_TOKEN is not None,
-        "api_key_length": len(API_TOKEN) if API_TOKEN else 0,
-        "model_max_length": get_model().tokenizer.model_max_length
+        "max_batch_size": MAX_BATCH_SIZE,
+        "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
     }
+
 
 if __name__ == "__main__":
     import uvicorn
