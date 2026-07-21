@@ -20,10 +20,38 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 MODEL = "intfloat/multilingual-e5-large"
+# Production is CPU-only; pin to CPU by default so we don't land on MPS/CUDA
+# where our manual tokenize -> forward path would mismatch tensor devices.
+DEVICE = os.environ.get("EMBED_DEVICE", "cpu")
 API_TOKEN = os.environ.get("EMBED_API_TOKEN")
 MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "32"))
 # Limit simultaneous inference calls so threads don't compete for CPU/GPU
 MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "4"))
+ENABLE_QUANTIZATION = os.environ.get("ENABLE_QUANTIZATION", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def _configure_torch_threads() -> tuple[int, int]:
+    """Cap PyTorch CPU threads before any model is created.
+
+    Must run at import time (before get_model). Defaults leave torch's
+    auto-detection alone when env vars are unset.
+    """
+    num_threads = os.environ.get("TORCH_NUM_THREADS")
+    interop_threads = os.environ.get("TORCH_INTEROP_THREADS")
+
+    if num_threads:
+        torch.set_num_threads(int(num_threads))
+    if interop_threads:
+        torch.set_num_interop_threads(int(interop_threads))
+
+    return torch.get_num_threads(), torch.get_num_interop_threads()
+
+
+TORCH_NUM_THREADS, TORCH_INTEROP_THREADS = _configure_torch_threads()
 
 _inference_semaphore: asyncio.Semaphore
 
@@ -39,18 +67,37 @@ def debug_api_key() -> bool:
 
 @lru_cache(maxsize=1)
 def get_model() -> SentenceTransformer:
-    logger.info(f"Loading model: {MODEL}")
-    model = SentenceTransformer(MODEL)
+    logger.info(f"Loading model: {MODEL} on device={DEVICE}")
+    model = SentenceTransformer(MODEL, device=DEVICE)
     model.eval()
+
+    if ENABLE_QUANTIZATION:
+        # Dynamic int8 on Linear layers — ~1.5-2x CPU throughput, slight quality trade-off
+        logger.info("Applying dynamic int8 quantization (ENABLE_QUANTIZATION=true)")
+        underlying = model[0].auto_model
+        # torch.ao.quantization is the supported path on torch 2.x
+        quantized = torch.ao.quantization.quantize_dynamic(
+            underlying,
+            {torch.nn.Linear},
+            dtype=torch.qint8,
+        )
+        model[0].auto_model = quantized
+
     return model
 
 
 def _encode(model: SentenceTransformer, texts: list[str]) -> tuple[list[list[float]], list[int]]:
     """Single tokenization pass: count tokens from attention mask, then run forward."""
-    features = model.tokenize(texts)
+    features = model.preprocess(texts)
     # Attention mask sum = actual (non-padding) token count per item
     token_counts: list[int] = features["attention_mask"].sum(dim=1).tolist()
-    with torch.no_grad():
+    # tokenize() returns CPU tensors; move them onto the model's device so the
+    # forward pass doesn't fail on MPS/CUDA with an unallocated-storage error.
+    features = {
+        k: v.to(model.device) if isinstance(v, torch.Tensor) else v
+        for k, v in features.items()
+    }
+    with torch.inference_mode():
         out = model.forward(features)
     embeddings: list[list[float]] = out["sentence_embedding"].cpu().numpy().tolist()
     return embeddings, token_counts
@@ -60,11 +107,21 @@ def _encode(model: SentenceTransformer, texts: list[str]) -> tuple[list[list[flo
 async def lifespan(_: FastAPI):
     global _inference_semaphore
     logger.info("Starting embedding service...")
+    logger.info(
+        "CPU threads: torch=%s interop=%s | OMP=%s MKL=%s | quantization=%s",
+        TORCH_NUM_THREADS,
+        TORCH_INTEROP_THREADS,
+        os.environ.get("OMP_NUM_THREADS", "unset"),
+        os.environ.get("MKL_NUM_THREADS", "unset"),
+        ENABLE_QUANTIZATION,
+    )
     debug_api_key()
     _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     try:
-        get_model()
-        logger.info("Model loaded successfully")
+        model = get_model()
+        # Warm-up: first real request otherwise pays for oneDNN / tokenizer lazy init
+        await run_in_threadpool(_encode, model, ["query: warm-up"])
+        logger.info("Model loaded and warmed up successfully")
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
         raise
@@ -186,12 +243,19 @@ async def get_embeddings_batch(
 async def debug_config(_: None = Depends(verify_token)):
     return {
         "model": MODEL,
+        "device": DEVICE,
         "api_key_configured": API_TOKEN is not None,
         "max_batch_size": MAX_BATCH_SIZE,
         "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
+        "torch_num_threads": TORCH_NUM_THREADS,
+        "torch_interop_threads": TORCH_INTEROP_THREADS,
+        "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+        "mkl_num_threads": os.environ.get("MKL_NUM_THREADS"),
+        "enable_quantization": ENABLE_QUANTIZATION,
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Single worker recommended: each worker loads a full ~2GB model copy into RAM
+    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)

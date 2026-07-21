@@ -1,5 +1,10 @@
-fastapi
-uvicorn[standard]
-sentence-transformers
-torch
-python-dotenv
+# Linux: CPU-only wheel from the PyTorch index (smaller image, no CUDA).
+# macOS/Windows: plain PyPI torch (no +cpu builds published for those platforms).
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch==2.13.0+cpu; sys_platform == "linux"
+torch==2.13.0; sys_platform != "linux"
+fastapi==0.139.2
+uvicorn[standard]==0.51.0
+sentence-transformers==5.6.0
+python-dotenv==1.2.2
