@@ -3,15 +3,18 @@ FROM python:3.13-slim
 # Avoid interactive prompts during install
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Tuned for the target Dokku host: 48 CPUs / 251 GiB RAM.
-# These thread settings optimize inference within a 24-CPU allocation. They are
-# not hard limits; enforce those with `dokku resource:limit` (see readme.md).
-ENV OMP_NUM_THREADS=24 \
-    MKL_NUM_THREADS=24 \
-    TORCH_NUM_THREADS=24 \
+# Tuned for the target OVH Dokku host (48 CPUs, ~45% already busy).
+# 16 threads ≈ 1/3 of the host, leaving headroom for co-located apps.
+# These are soft thread caps — not hard cgroup quotas. On this OVH kernel,
+# --cpus / NanoCPUs fails (no CFS quota); use --cpuset-cpus or --cpu-shares
+# instead (see readme.md).
+ENV OMP_NUM_THREADS=16 \
+    MKL_NUM_THREADS=16 \
+    TORCH_NUM_THREADS=16 \
     TORCH_INTEROP_THREADS=1 \
     MAX_CONCURRENT_REQUESTS=1 \
     MAX_BATCH_SIZE=32 \
+    EMBED_DEVICE=cpu \
     ENABLE_QUANTIZATION=false \
     TOKENIZERS_PARALLELISM=false \
     MALLOC_ARENA_MAX=2 \

@@ -59,9 +59,10 @@ All knobs are environment variables (see `.env.example`).
 - **`EMBED_API_TOKEN`** (required) — Bearer token for `/embed` endpoints
 - **`MAX_BATCH_SIZE`** (default `32`) — max texts per `/embed/batch` request
 - **`MAX_CONCURRENT_REQUESTS`** (default `1` in Docker, `4` in code) — semaphore limiting parallel inference
-- **`TORCH_NUM_THREADS`** (default `24` in Docker) — PyTorch intra-op CPU threads
+- **`TORCH_NUM_THREADS`** (default `16` in Docker) — PyTorch intra-op CPU threads
 - **`TORCH_INTEROP_THREADS`** (default `1`) — PyTorch inter-op threads
-- **`OMP_NUM_THREADS`** / **`MKL_NUM_THREADS`** (default `24` in Docker) — OpenMP / MKL thread caps (set before process start)
+- **`OMP_NUM_THREADS`** / **`MKL_NUM_THREADS`** (default `16` in Docker) — OpenMP / MKL thread caps (set before process start)
+- **`EMBED_DEVICE`** (default `cpu`) — inference device (`cpu`, `mps`, or `cuda`)
 - **`ENABLE_QUANTIZATION`** (default `false`) — dynamic int8 on Linear layers (~1.5–2× CPU throughput, slight quality trade-off)
 - **`TOKENIZERS_PARALLELISM`** (default `false`) — disables HF tokenizer thread pool oversubscription
 
@@ -77,39 +78,45 @@ curl -H "Authorization: Bearer $EMBED_API_TOKEN" http://127.0.0.1:8000/debug/con
 
 ## Limiting CPU / resources
 
-### Dokku target: 48 CPUs / 251 GiB RAM
+### Dokku target: OVH 48 CPUs / 251 GiB RAM
 
-The Dockerfile is tuned to use at most 24 compute threads per inference. Thread
-settings are performance controls, not hard resource boundaries. Apply Dokku
-cgroup limits to guarantee that the app cannot exceed 50% of host CPU and the
-selected practical 16 GiB RAM ceiling:
+The Dockerfile defaults to **16 compute threads** (≈1/3 of the host) so
+co-located apps keep headroom. Thread settings are soft caps — not hard
+cgroup quotas.
+
+**Important:** this OVH kernel rejects Docker `--cpus` / NanoCPUs
+(`kernel does not support CPU CFS scheduler`). Clear any CPU resource limit
+and use `--cpuset-cpus` (preferred) or `--cpu-shares` instead.
 
 ```bash
 APP=embeddy
 
-# Runtime/deploy containers: hard limit of 24 CPUs and 16 GiB RAM+swap.
-# Setting memory-swap equal to memory prevents additional swap consumption.
-dokku resource:limit --cpu 24 --memory 16g --memory-swap 16g "$APP"
+# Memory hard limit only (CPU quota via --cpu does not work on this host).
+dokku resource:limit --cpu clear "$APP"
+dokku resource:limit --memory 16g --memory-swap 16g "$APP"
 
-# Ensure Dokku passes the matching inference settings.
+# Soft thread defaults are already in the image; override only if needed.
 dokku config:set "$APP" \
-  TORCH_NUM_THREADS=24 \
+  EMBED_API_TOKEN=your-secret-token \
+  TORCH_NUM_THREADS=16 \
   TORCH_INTEROP_THREADS=1 \
-  OMP_NUM_THREADS=24 \
-  MKL_NUM_THREADS=24 \
+  OMP_NUM_THREADS=16 \
+  MKL_NUM_THREADS=16 \
   MAX_CONCURRENT_REQUESTS=1 \
+  EMBED_DEVICE=cpu \
   TOKENIZERS_PARALLELISM=false
 
-# Limits take effect on the next deploy/rebuild.
-dokku ps:rebuild "$APP"
+# Preferred hard CPU pin (16 cores). If this errors, use --cpu-shares below.
+dokku docker-options:add "$APP" deploy "--cpuset-cpus=0-15"
+# Fallback soft priority (always supported):
+# dokku docker-options:add "$APP" deploy "--cpu-shares=512"
 
-# Verify the configured limits.
+dokku docker-options:report "$APP"
 dokku resource:report "$APP"
+dokku ps:rebuild "$APP"
 ```
 
-The 16 GiB memory limit is intentionally much lower than half of the currently
-available ~163 GiB because this model does not need an 80 GiB allowance. Do not
-run multiple web processes: every process loads another full model copy.
+Do not run multiple web processes: every process loads another full ~2GB model copy.
 
 To limit Dockerfile build memory as well:
 
@@ -117,29 +124,22 @@ To limit Dockerfile build memory as well:
 dokku resource:limit --memory 16g --memory-swap 16g --process-type build "$APP"
 ```
 
-Dokku's Dockerfile builder supports build-time memory limits but not build-time
-CPU limits. Constrain build CPU at the host/cgroup level if that is also
-required. Runtime CPU remains hard-limited by the 24-CPU app limit above.
-
 ### Plain Docker runtime
-
-Cap container CPU and memory, and optionally override thread env vars:
 
 ```bash
 docker run --env-file .env \
-  --cpus="24" \
+  --cpuset-cpus="0-15" \
   --memory="16g" \
   --memory-swap="16g" \
-  -e TORCH_NUM_THREADS=24 \
-  -e OMP_NUM_THREADS=24 \
+  -e TORCH_NUM_THREADS=16 \
+  -e OMP_NUM_THREADS=16 \
   -e MAX_CONCURRENT_REQUESTS=1 \
   -p 8000:8000 \
   embeddy
 ```
 
-Keep `TORCH_NUM_THREADS` / `OMP_NUM_THREADS` equal to the CPU allocation, and
-keep `MAX_CONCURRENT_REQUESTS=1` so simultaneous inferences do not compete for
-the same cores.
+Keep `TORCH_NUM_THREADS` / `OMP_NUM_THREADS` equal to the pinned core count,
+and keep `MAX_CONCURRENT_REQUESTS=1` so simultaneous inferences do not compete.
 
 ### At build time
 
